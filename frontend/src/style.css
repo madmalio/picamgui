@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@theme {
+  --color-zinc-950: #09090b;
+  --color-accent-blue: #0ea5e9;
+  --font-camera: "Inter", "SF Pro", system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-zinc-950 text-white font-camera overflow-hidden select-none;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer components {
+  .btn-tactile {
+    @apply active:scale-95 transition-transform duration-75;
+  }
+  
+  .glass {
+    @apply bg-zinc-900/60 backdrop-blur-md border border-zinc-800/50;
+  }
+
+  .telemetry-label {
+    @apply text-[10px] uppercase tracking-wider text-zinc-500 font-bold;
+  }
+
+  .telemetry-value {
+    @apply text-xl font-medium tracking-tight leading-none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
