@@ -47,6 +47,57 @@ const OPTIONS = {
 
 // --- Sub-components ---
 
+// --- Backend Bridge ---
+const isWails = !!(window.go && window.go.main && window.go.main.App);
+
+const callBackend = async (method, ...args) => {
+  if (isWails) {
+    return window.go.main.App[method](...args);
+  }
+
+  // Fallback to REST API for Browser Mode
+  const endpoints = {
+    GetSystemStats: '/api/stats',
+    GetAudioLevels: '/api/audio',
+    UpdateConfig: '/api/config',
+    ToggleRecording: '/api/record',
+    ListCaptures: '/api/captures',
+    DeleteCapture: '/api/captures'
+  };
+
+  const url = endpoints[method];
+  if (!url) return null;
+
+  try {
+    if (method === 'UpdateConfig') {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(args[0])
+      });
+      return res.json();
+    }
+
+    if (method === 'ToggleRecording') {
+      const res = await fetch(url, { method: 'POST' });
+      const data = await res.json();
+      return data.recording;
+    }
+
+    if (method === 'DeleteCapture') {
+      const res = await fetch(`${url}?name=${args[0]}`, { method: 'DELETE' });
+      const data = await res.json();
+      return data.success;
+    }
+
+    const res = await fetch(url);
+    return res.json();
+  } catch (err) {
+    console.error(`API Error (${method}):`, err);
+    throw err;
+  }
+};
+
 const Histogram = memo(({ data = [] }) => {
   if (!data || data.length === 0) return <div className="w-32 h-14 glass rounded-xl" />;
 
@@ -92,7 +143,7 @@ const VUMeter = memo(({ levels = [0, 0] }) => (
 
 const LivePreview = memo(({ isRecording, settings, orientation }) => {
   const [error, setError] = useState(false);
-  const streamUrl = "http://localhost:8081/stream";
+  const streamUrl = isWails ? "http://localhost:8081/stream" : `http://${window.location.hostname}:8081/stream`;
 
   return (
     <div className="relative w-full h-full bg-zinc-950 flex items-center justify-center overflow-hidden">
@@ -193,23 +244,22 @@ const MediaGallery = () => {
   const [loading, setLoading] = useState(true);
 
   const refreshFiles = useCallback(() => {
-    if (window.go && window.go.main && window.go.main.App) {
-      window.go.main.App.ListCaptures()
-        .then(res => {
-          setFiles(res || []);
-          setLoading(false);
-        })
-        .catch(err => {
-          console.error(err);
-          setLoading(false);
-        });
-    } else {
-      setFiles([
-        { name: 'CLIP_20260512_120001.mp4', size: 104857600, date: '2026-05-12 12:00' },
-        { name: 'CLIP_20260512_120512.mp4', size: 52428800, date: '2026-05-12 12:05' },
-      ]);
-      setLoading(false);
-    }
+    callBackend('ListCaptures')
+      .then(res => {
+        setFiles(res || []);
+        setLoading(false);
+      })
+      .catch(err => {
+        console.error(err);
+        if (!isWails) {
+           // Mock for browser mode if server is down
+           setFiles([
+            { name: 'CLIP_20260512_120001.mp4', size: 104857600, date: '2026-05-12 12:00' },
+            { name: 'CLIP_20260512_120512.mp4', size: 52428800, date: '2026-05-12 12:05' },
+          ]);
+        }
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -217,9 +267,7 @@ const MediaGallery = () => {
   }, [refreshFiles]);
 
   const deleteFile = (name) => {
-    if (window.go && window.go.main && window.go.main.App) {
-      window.go.main.App.DeleteCapture(name).then(() => refreshFiles());
-    }
+    callBackend('DeleteCapture', name).then(() => refreshFiles());
   };
 
   const formatSize = (bytes) => {
@@ -897,17 +945,13 @@ const App = () => {
 
   // Sync settings with Go backend
   useEffect(() => {
-    if (window.go && window.go.main && window.go.main.App) {
-      window.go.main.App.UpdateConfig(settings).catch(console.error);
-    }
+    callBackend('UpdateConfig', settings).catch(console.error);
   }, [settings]);
 
   // System Polling
   useEffect(() => {
     const poll = () => {
-      if (window.go && window.go.main && window.go.main.App) {
-        window.go.main.App.GetSystemStats().then(setSystemStats).catch(console.error);
-      }
+      callBackend('GetSystemStats').then(setSystemStats).catch(console.error);
     };
     poll();
     const interval = setInterval(poll, 3000);
@@ -917,20 +961,14 @@ const App = () => {
   // Audio Polling (Faster refresh for VU meters)
   useEffect(() => {
     const pollAudio = () => {
-      if (window.go && window.go.main && window.go.main.App) {
-        window.go.main.App.GetAudioLevels().then(setAudioLevels).catch(console.error);
-      }
+      callBackend('GetAudioLevels').then(setAudioLevels).catch(console.error);
     };
     const interval = setInterval(pollAudio, 150); // 10fps refresh for meters
     return () => clearInterval(interval);
   }, []);
 
   const toggleRecording = useCallback(() => {
-    if (window.go && window.go.main && window.go.main.App) {
-      window.go.main.App.ToggleRecording().then(setIsRecording).catch(console.error);
-    } else {
-      setIsRecording(!isRecording);
-    }
+    callBackend('ToggleRecording').then(setIsRecording).catch(console.error);
   }, [isRecording]);
 
   useEffect(() => {

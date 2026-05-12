@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"embed"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
+	"io/fs"
 	"math/rand"
 	"mime/multipart"
 	"net/http"
@@ -67,6 +70,7 @@ type SystemStats struct {
 // App struct
 type App struct {
 	ctx          context.Context
+	assets       embed.FS
 	settings     CameraSettings
 	settingsLock sync.Mutex
 	frameReady   chan []byte
@@ -79,8 +83,9 @@ type App struct {
 }
 
 // NewApp creates a new App application struct
-func NewApp() *App {
+func NewApp(assets embed.FS) *App {
 	return &App{
+		assets:     assets,
 		frameReady: make(chan []byte, 1),
 		histogram:  make([]int, 256),
 		settings: CameraSettings{
@@ -385,16 +390,64 @@ func (a *App) ToggleRecording() bool {
 	if a.isRecording {
 		a.recordStart = time.Now()
 		fmt.Println("Recording Started")
-		// MOCK: Create a dummy file
+
 		if runtime.GOOS == "windows" {
 			os.MkdirAll("captures", 0755)
 			fname := fmt.Sprintf("CLIP_%s.mp4", a.recordStart.Format("20060102_150405"))
 			os.WriteFile(filepath.Join("captures", fname), []byte("dummy video data"), 0644)
+		} else {
+			// On Linux/Pi, we use rpicam-vid to record high-quality H.264
+			// This is a second instance or we'd need to multiplex the stream.
+			// For simplicity, we'll spawn a dedicated recording process.
+			go a.runProductionRecord()
 		}
 	} else {
 		fmt.Printf("Recording Stopped. Duration: %v\n", time.Since(a.recordStart))
+		// For the recording process, we'll handle termination via a context or killing the process
 	}
 	return a.isRecording
+}
+
+// runProductionRecord handles the high-quality H.264 recording on Pi
+func (a *App) runProductionRecord() {
+	a.settingsLock.Lock()
+	fps := a.settings.FPS
+	bitrate := a.settings.Bitrate
+	codec := a.settings.Codec // "H.264 (HW)"
+	a.settingsLock.Unlock()
+
+	os.MkdirAll("captures", 0755)
+	fname := filepath.Join("captures", fmt.Sprintf("CLIP_%s.mp4", a.recordStart.Format("20060102_150405")))
+
+	// rpicam-vid for recording
+	args := []string{
+		"-t", "0", // Infinite until killed
+		"--width", "1920",
+		"--height", "1080",
+		"--framerate", fmt.Sprintf("%f", fps),
+		"--bitrate", fmt.Sprintf("%d000000", bitrate),
+		"-o", fname,
+	}
+
+	if codec == "H.264 (HW)" {
+		args = append(args, "--codec", "h264")
+	}
+
+	cmd := exec.Command("rpicam-vid", args...)
+	err := cmd.Start()
+	if err != nil {
+		fmt.Printf("Failed to start recording process: %v\n", err)
+		return
+	}
+
+	// Wait until a.isRecording becomes false
+	for a.isRecording {
+		time.Sleep(time.Millisecond * 100)
+	}
+
+	cmd.Process.Signal(os.Interrupt) // Graceful stop for MP4 container
+	cmd.Wait()
+	fmt.Printf("Saved recording to %s\n", fname)
 }
 
 // UpdateConfig is called from the frontend
@@ -453,4 +506,58 @@ func (a *App) DeleteCapture(name string) bool {
 // GetOS returns the current operating system
 func (a *App) GetOS() string {
 	return runtime.GOOS
+}
+
+// StartHeadlessServer provides access via standard browser
+func (a *App) StartHeadlessServer() {
+	// API Endpoints
+	http.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := a.GetSystemStats()
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	http.HandleFunc("/api/audio", func(w http.ResponseWriter, r *http.Request) {
+		levels := a.GetAudioLevels()
+		json.NewEncoder(w).Encode(levels)
+	})
+
+	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var s CameraSettings
+			if err := json.NewDecoder(r.Body).Decode(&s); err == nil {
+				a.UpdateConfig(s)
+			}
+		}
+		a.settingsLock.Lock()
+		s := a.settings
+		a.settingsLock.Unlock()
+		json.NewEncoder(w).Encode(s)
+	})
+
+	http.HandleFunc("/api/record", func(w http.ResponseWriter, r *http.Request) {
+		recording := a.ToggleRecording()
+		json.NewEncoder(w).Encode(map[string]bool{"recording": recording})
+	})
+
+	http.HandleFunc("/api/captures", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			name := r.URL.Query().Get("name")
+			success := a.DeleteCapture(name)
+			json.NewEncoder(w).Encode(map[string]bool{"success": success})
+			return
+		}
+		files := a.ListCaptures()
+		json.NewEncoder(w).Encode(files)
+	})
+
+	// Static Files from Embedded Assets
+	// The assets are embedded as "frontend/dist"
+	dist, _ := fs.Sub(a.assets, "frontend/dist")
+	fileServer := http.FileServer(http.FS(dist))
+	http.Handle("/", fileServer)
+
+	fmt.Println("Headless Server started on http://localhost:8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Printf("Headless server error: %v\n", err)
+	}
 }
