@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"embed"
@@ -74,12 +75,15 @@ type App struct {
 	settings     CameraSettings
 	settingsLock sync.Mutex
 	frameReady   chan []byte
+	listeners    []chan []byte
+	listenersMu  sync.Mutex
 	isRecording  bool
 	recordStart  time.Time
 	lumBuffer    []int
 	bufferLock   sync.Mutex
 	histogram    []int
 	cmd          *exec.Cmd
+	cmdMu        sync.Mutex
 }
 
 // NewApp creates a new App application struct
@@ -144,6 +148,7 @@ func (a *App) startProductionStream() {
 			"--width", "1280",
 			"--height", "720",
 			"--framerate", fmt.Sprintf("%f", fps),
+			"--quality", "40",
 			"-o", "-",
 		}
 
@@ -166,9 +171,6 @@ func (a *App) startProductionStream() {
 		args = append(args, "--awb", awbMode)
 
 		if wb == "Manual" {
-			// Very rough Kelvin to RGB gains approximation
-			// For a real app, use a proper table or libcamera's color temperature support if available
-			// rpicam-vid doesn't have a direct Kelvin flag, but we can use --awbgains
 			args = append(args, "--awbgains", "1.5,1.5") // Placeholder
 		}
 
@@ -180,7 +182,10 @@ func (a *App) startProductionStream() {
 		}
 
 		cmd := exec.Command("rpicam-vid", args...)
+		a.cmdMu.Lock()
 		a.cmd = cmd
+		a.cmdMu.Unlock()
+
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			fmt.Printf("Error creating stdout pipe: %v\n", err)
@@ -193,63 +198,94 @@ func (a *App) startProductionStream() {
 			time.Sleep(time.Second)
 			continue
 		}
+		fmt.Printf("Camera started with PID: %d\n", cmd.Process.Pid)
 
-		// Buffer to store frame data
-		buffer := make([]byte, 1024*1024)
-		frame := new(bytes.Buffer)
-
+		scanner := bufio.NewReaderSize(stdout, 1024*1024)
+		counter := 0
 		for {
-			n, err := stdout.Read(buffer)
+			_, err := scanner.ReadSlice(0xFF)
 			if err != nil {
-				// Command likely killed or crashed
 				break
 			}
 
-			data := buffer[:n]
-			for i := 0; i < len(data); i++ {
-				if i < len(data)-1 && data[i] == 0xFF && data[i+1] == 0xD8 {
-					frame.Reset()
+			nextByte, err := scanner.ReadByte()
+			if err != nil {
+				break
+			}
+
+			if nextByte != 0xD8 {
+				continue
+			}
+
+			frame := new(bytes.Buffer)
+			frame.WriteByte(0xFF)
+			frame.WriteByte(0xD8)
+
+			for {
+				data, err := scanner.ReadSlice(0xFF)
+				if err != nil {
+					goto restart_camera
 				}
-				frame.WriteByte(data[i])
+				frame.Write(data)
 
-				if i > 0 && data[i-1] == 0xFF && data[i] == 0xD9 {
-					rawFrame := frame.Bytes()
+				nextByte, err := scanner.ReadByte()
+				if err != nil {
+					goto restart_camera
+				}
+				frame.WriteByte(nextByte)
 
-					a.settingsLock.Lock()
-					peaking := a.settings.Peaking
-					a.settingsLock.Unlock()
-
-					if peaking {
-						img, err := jpeg.Decode(bytes.NewReader(rawFrame))
-						if err == nil {
-							rgba, ok := img.(*image.RGBA)
-							if !ok {
-								bounds := img.Bounds()
-								rgba = image.NewRGBA(bounds)
-								draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
-							}
-
-							a.bufferLock.Lock()
-							w, h := rgba.Bounds().Dx(), rgba.Bounds().Dy()
-							if len(a.lumBuffer) < w*h {
-								a.lumBuffer = make([]int, w*h)
-							}
-							ApplyFocusPeaking(rgba, a.lumBuffer, a.histogram)
-							a.bufferLock.Unlock()
-
-							var b bytes.Buffer
-							jpeg.Encode(&b, rgba, &jpeg.Options{Quality: 75})
-							rawFrame = b.Bytes()
-						}
-					}
-
-					select {
-					case a.frameReady <- rawFrame:
-					default:
-					}
+				if nextByte == 0xD9 {
+					break
 				}
 			}
+
+			rawFrame := frame.Bytes()
+			a.settingsLock.Lock()
+			peaking := a.settings.Peaking
+			a.settingsLock.Unlock()
+
+			// Only process image if peaking is on OR it's time for a histogram update (every 6th frame ~4fps)
+			a.bufferLock.Lock()
+			counter++
+			shouldUpdateHistogram := (counter%6 == 0)
+			a.bufferLock.Unlock()
+
+			if peaking || shouldUpdateHistogram {
+				img, err := jpeg.Decode(bytes.NewReader(rawFrame))
+				if err == nil {
+					rgba, ok := img.(*image.RGBA)
+					if !ok {
+						bounds := img.Bounds()
+						rgba = image.NewRGBA(bounds)
+						draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
+					}
+
+					a.bufferLock.Lock()
+					w, h := rgba.Bounds().Dx(), rgba.Bounds().Dy()
+					if len(a.lumBuffer) < w*h {
+						a.lumBuffer = make([]int, w*h)
+					}
+
+					// If peaking is off, only update histogram
+					if peaking {
+						ApplyFocusPeaking(rgba, a.lumBuffer, a.histogram)
+
+						var b bytes.Buffer
+						jpeg.Encode(&b, rgba, &jpeg.Options{Quality: 75})
+						rawFrame = b.Bytes()
+					} else if shouldUpdateHistogram {
+						// Efficiently update histogram without peaking
+						UpdateHistogramOnly(rgba, a.histogram)
+					}
+					a.bufferLock.Unlock()
+				}
+			}
+
+			a.broadcastFrame(rawFrame)
 		}
+
+	restart_camera:
+		cmd.Process.Kill()
 		cmd.Wait()
 		fmt.Println("Camera process exited, restarting...")
 		time.Sleep(time.Millisecond * 100)
@@ -262,9 +298,25 @@ func (a *App) startStreamServer() {
 		m := multipart.NewWriter(w)
 		w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+m.Boundary())
 
+		child := make(chan []byte, 1)
+		a.listenersMu.Lock()
+		a.listeners = append(a.listeners, child)
+		a.listenersMu.Unlock()
+
+		defer func() {
+			a.listenersMu.Lock()
+			for i, listener := range a.listeners {
+				if listener == child {
+					a.listeners = append(a.listeners[:i], a.listeners[i+1:]...)
+					break
+				}
+			}
+			a.listenersMu.Unlock()
+		}()
+
 		for {
 			select {
-			case frame := <-a.frameReady:
+			case frame := <-child:
 				header := make(textproto.MIMEHeader)
 				header.Set("Content-Type", "image/jpeg")
 				header.Set("Content-Length", fmt.Sprintf("%d", len(frame)))
@@ -290,6 +342,18 @@ func (a *App) startStreamServer() {
 	}
 }
 
+// broadcastFrame sends the frame to all connected listeners
+func (a *App) broadcastFrame(frame []byte) {
+	a.listenersMu.Lock()
+	defer a.listenersMu.Unlock()
+	for _, listener := range a.listeners {
+		select {
+		case listener <- frame:
+		default:
+		}
+	}
+}
+
 // generateMockFrames simulates camera output
 func (a *App) generateMockFrames() {
 	width, height := 1280, 720
@@ -301,10 +365,8 @@ func (a *App) generateMockFrames() {
 	for range tick.C {
 		counter++
 
-		// Render dynamic test pattern
 		bgColor := color.RGBA{12, 12, 14, 255}
 		if a.isRecording {
-			// Subtle red tint when recording
 			bgColor = color.RGBA{20, 10, 10, 255}
 		}
 		draw.Draw(img, img.Bounds(), &image.Uniform{bgColor}, image.Point{}, draw.Src)
@@ -312,12 +374,10 @@ func (a *App) generateMockFrames() {
 		xPos := (counter * 8) % width
 		draw.Draw(img, image.Rect(xPos, 0, xPos+40, height), &image.Uniform{color.RGBA{14, 165, 233, 80}}, image.Point{}, draw.Over)
 
-		// Grid
 		for i := 0; i < width; i += 160 {
 			draw.Draw(img, image.Rect(i, 0, i+1, height), &image.Uniform{color.RGBA{255, 255, 255, 15}}, image.Point{}, draw.Over)
 		}
 
-		// Real Edge Detection Focus Peaking
 		if a.settings.Peaking {
 			a.bufferLock.Lock()
 			if len(a.lumBuffer) < width*height {
@@ -330,10 +390,7 @@ func (a *App) generateMockFrames() {
 		var b bytes.Buffer
 		jpeg.Encode(&b, img, &jpeg.Options{Quality: 75})
 
-		select {
-		case a.frameReady <- b.Bytes():
-		default:
-		}
+		a.broadcastFrame(b.Bytes())
 	}
 }
 
@@ -355,12 +412,10 @@ func (a *App) GetSystemStats() SystemStats {
 			IsThrottled: false,
 		}
 	} else {
-		// Real Linux logic (simplified for Pi)
 		d, _ := disk.Usage("/")
 		stats.DiskFree = d.Free
 		stats.DiskTotal = d.Total
 
-		// Temperature (Pi specific)
 		data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
 		if err == nil {
 			var rawTemp int
@@ -377,7 +432,6 @@ func (a *App) GetSystemStats() SystemStats {
 
 // GetAudioLevels returns mock audio levels for VU meters
 func (a *App) GetAudioLevels() []float64 {
-	// Mock random levels between 0.2 and 0.8
 	return []float64{
 		0.2 + rand.Float64()*0.6,
 		0.2 + rand.Float64()*0.6,
@@ -396,14 +450,10 @@ func (a *App) ToggleRecording() bool {
 			fname := fmt.Sprintf("CLIP_%s.mp4", a.recordStart.Format("20060102_150405"))
 			os.WriteFile(filepath.Join("captures", fname), []byte("dummy video data"), 0644)
 		} else {
-			// On Linux/Pi, we use rpicam-vid to record high-quality H.264
-			// This is a second instance or we'd need to multiplex the stream.
-			// For simplicity, we'll spawn a dedicated recording process.
 			go a.runProductionRecord()
 		}
 	} else {
 		fmt.Printf("Recording Stopped. Duration: %v\n", time.Since(a.recordStart))
-		// For the recording process, we'll handle termination via a context or killing the process
 	}
 	return a.isRecording
 }
@@ -413,15 +463,14 @@ func (a *App) runProductionRecord() {
 	a.settingsLock.Lock()
 	fps := a.settings.FPS
 	bitrate := a.settings.Bitrate
-	codec := a.settings.Codec // "H.264 (HW)"
+	codec := a.settings.Codec
 	a.settingsLock.Unlock()
 
 	os.MkdirAll("captures", 0755)
 	fname := filepath.Join("captures", fmt.Sprintf("CLIP_%s.mp4", a.recordStart.Format("20060102_150405")))
 
-	// rpicam-vid for recording
 	args := []string{
-		"-t", "0", // Infinite until killed
+		"-t", "0",
 		"--width", "1920",
 		"--height", "1080",
 		"--framerate", fmt.Sprintf("%f", fps),
@@ -440,12 +489,11 @@ func (a *App) runProductionRecord() {
 		return
 	}
 
-	// Wait until a.isRecording becomes false
 	for a.isRecording {
 		time.Sleep(time.Millisecond * 100)
 	}
 
-	cmd.Process.Signal(os.Interrupt) // Graceful stop for MP4 container
+	cmd.Process.Signal(os.Interrupt)
 	cmd.Wait()
 	fmt.Printf("Saved recording to %s\n", fname)
 }
@@ -463,12 +511,13 @@ func (a *App) UpdateConfig(settings CameraSettings) {
 
 	fmt.Printf("Camera Hardware Config Updated: FPS:%v ISO:%v SHUT:%s WB:%s Kelvin:%v\n", settings.FPS, settings.ISO, settings.Shutter, settings.WB, settings.Kelvin)
 
-	// Restart camera if hardware settings changed and we are on Linux
 	if runtime.GOOS == "linux" {
 		if settings.FPS != oldFPS || settings.ISO != oldISO || settings.Shutter != oldShutter || settings.WB != oldWB || settings.Kelvin != oldKelvin {
+			a.cmdMu.Lock()
 			if a.cmd != nil && a.cmd.Process != nil {
 				a.cmd.Process.Kill()
 			}
+			a.cmdMu.Unlock()
 		}
 	}
 }
@@ -510,18 +559,19 @@ func (a *App) GetOS() string {
 
 // StartHeadlessServer provides access via standard browser
 func (a *App) StartHeadlessServer() {
-	// API Endpoints
-	http.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		stats := a.GetSystemStats()
 		json.NewEncoder(w).Encode(stats)
 	})
 
-	http.HandleFunc("/api/audio", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/audio", func(w http.ResponseWriter, r *http.Request) {
 		levels := a.GetAudioLevels()
 		json.NewEncoder(w).Encode(levels)
 	})
 
-	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var s CameraSettings
 			if err := json.NewDecoder(r.Body).Decode(&s); err == nil {
@@ -534,12 +584,12 @@ func (a *App) StartHeadlessServer() {
 		json.NewEncoder(w).Encode(s)
 	})
 
-	http.HandleFunc("/api/record", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/record", func(w http.ResponseWriter, r *http.Request) {
 		recording := a.ToggleRecording()
 		json.NewEncoder(w).Encode(map[string]bool{"recording": recording})
 	})
 
-	http.HandleFunc("/api/captures", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/captures", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			name := r.URL.Query().Get("name")
 			success := a.DeleteCapture(name)
@@ -550,14 +600,66 @@ func (a *App) StartHeadlessServer() {
 		json.NewEncoder(w).Encode(files)
 	})
 
-	// Static Files from Embedded Assets
-	// The assets are embedded as "frontend/dist"
 	dist, _ := fs.Sub(a.assets, "frontend/dist")
 	fileServer := http.FileServer(http.FS(dist))
-	http.Handle("/", fileServer)
+	mux.Handle("/", fileServer)
 
-	fmt.Println("Headless Server started on http://localhost:8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	// Stream is on a different port currently, but let's also allow it here
+	mux.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		// Just redirect or proxy? Let's just handle it here too for convenience
+		a.handleStream(w, r)
+	})
+
+	// Add logging middleware
+	loggingMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/stats" && r.URL.Path != "/api/audio" && r.URL.Path != "/stream" {
+			fmt.Printf("%s %s %s\n", r.Method, r.URL.Path, r.RemoteAddr)
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	fmt.Println("Headless Server started on http://0.0.0.0:8080")
+	if err := http.ListenAndServe(":8080", loggingMux); err != nil {
 		fmt.Printf("Headless server error: %v\n", err)
+	}
+}
+
+func (a *App) handleStream(w http.ResponseWriter, r *http.Request) {
+	m := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+m.Boundary())
+
+	child := make(chan []byte, 1)
+	a.listenersMu.Lock()
+	a.listeners = append(a.listeners, child)
+	a.listenersMu.Unlock()
+
+	defer func() {
+		a.listenersMu.Lock()
+		for i, listener := range a.listeners {
+			if listener == child {
+				a.listeners = append(a.listeners[:i], a.listeners[i+1:]...)
+				break
+			}
+		}
+		a.listenersMu.Unlock()
+	}()
+
+	for {
+		select {
+		case frame := <-child:
+			header := make(textproto.MIMEHeader)
+			header.Set("Content-Type", "image/jpeg")
+			header.Set("Content-Length", fmt.Sprintf("%d", len(frame)))
+			mw, err := m.CreatePart(header)
+			if err != nil {
+				return
+			}
+			_, err = mw.Write(frame)
+			if err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
 	}
 }

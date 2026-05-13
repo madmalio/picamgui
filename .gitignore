@@ -1,3 +1,33 @@
+# Wails / Go
 build/bin
-node_modules
+picam.exe
+picam-headless
+picam-v2
+/build/windows
+/build/darwin
+/build/linux
+
+# Frontend
+frontend/node_modules
 frontend/dist
+frontend/.vite
+frontend/package-lock.json.md5
+
+# Media / Data
+captures/
+*.mp4
+*.mjpeg
+*.h264
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.bak
+
+# Environment / Secrets
+.env
+.env.*
+! .env.example

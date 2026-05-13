@@ -22,6 +22,10 @@ export function ListCaptures() {
   return window['go']['main']['App']['ListCaptures']();
 }
 
+export function StartHeadlessServer() {
+  return window['go']['main']['App']['StartHeadlessServer']();
+}
+
 export function ToggleRecording() {
   return window['go']['main']['App']['ToggleRecording']();
 }

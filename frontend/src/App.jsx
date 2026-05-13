@@ -143,19 +143,54 @@ const VUMeter = memo(({ levels = [0, 0] }) => (
 
 const LivePreview = memo(({ isRecording, settings, orientation }) => {
   const [error, setError] = useState(false);
-  const streamUrl = isWails ? "http://localhost:8081/stream" : `http://${window.location.hostname}:8081/stream`;
+  const [key, setKey] = useState(0);
+  const [retryCount, setRetryCount] = useState(0);
+  const streamUrl = isWails ? "http://localhost:8081/stream" : `${window.location.origin}/stream`;
+
+  // Only refresh the image source when exposure settings change
+  useEffect(() => {
+    setKey(prev => prev + 1);
+    setError(false);
+  }, [settings.fps, settings.iso, settings.shutter, settings.wb, settings.kelvin]);
+
+  // Auto-reconnect loop if stream fails
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => {
+        setError(false);
+        setKey(k => k + 1);
+        setRetryCount(r => r + 1);
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
 
   return (
     <div className="relative w-full h-full bg-zinc-950 flex items-center justify-center overflow-hidden">
       {/* 1. Base Video Feed */}
       {!error ? (
         <img 
-          src={`${streamUrl}?t=${new Date().getTime()}`} 
+          key={`${key}-${retryCount}`}
+          src={streamUrl} 
           className={cn(
             "w-full h-full object-cover transition-all duration-300",
             settings.peaking && "brightness-125 contrast-150 saturate-0",
             settings.falseColor && "brightness-100 contrast-100" // Reset for filter
           )} 
+          style={{ filter: settings.falseColor ? 'url(#false-color-filter)' : 'none' }}
+          onError={() => setError(true)}
+          alt="Camera Feed"
+        />
+      ) : (
+        <div className="flex flex-col items-center gap-4">
+          <Camera className="w-16 h-16 text-zinc-800 animate-pulse" strokeWidth={1} />
+          <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-700">
+            {isWails ? "Hardware Offline" : "Connecting to Stream..."}
+          </span>
+          {!isWails && <div className="text-[8px] text-zinc-800 font-mono">Attempt {retryCount + 1}</div>}
+        </div>
+      )}
+
           style={{ filter: settings.falseColor ? 'url(#false-color-filter)' : 'none' }}
           onError={() => setError(true)}
           alt="Camera Feed"
@@ -943,9 +978,12 @@ const App = () => {
     }
   }, [settings.fps, settings.shutterMode]);
 
-  // Sync settings with Go backend
+  // Sync settings with Go backend (Debounced)
   useEffect(() => {
-    callBackend('UpdateConfig', settings).catch(console.error);
+    const timer = setTimeout(() => {
+      callBackend('UpdateConfig', settings).catch(console.error);
+    }, 200); // 200ms debounce
+    return () => clearTimeout(timer);
   }, [settings]);
 
   // System Polling

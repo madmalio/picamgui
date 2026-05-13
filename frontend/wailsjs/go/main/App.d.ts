@@ -12,6 +12,8 @@ export function GetSystemStats():Promise<main.SystemStats>;
 
 export function ListCaptures():Promise<Array<main.FileInfo>>;
 
+export function StartHeadlessServer():Promise<void>;
+
 export function ToggleRecording():Promise<boolean>;
 
 export function UpdateConfig(arg1:main.CameraSettings):Promise<void>;

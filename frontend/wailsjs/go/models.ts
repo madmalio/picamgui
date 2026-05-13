@@ -74,6 +74,7 @@ export namespace main {
 	    memoryFree: number;
 	    isThrottled: boolean;
 	    audioLevels: number[];
+	    histogram: number[];
 	
 	    static createFrom(source: any = {}) {
 	        return new SystemStats(source);
@@ -88,6 +89,7 @@ export namespace main {
 	        this.memoryFree = source["memoryFree"];
 	        this.isThrottled = source["isThrottled"];
 	        this.audioLevels = source["audioLevels"];
+	        this.histogram = source["histogram"];
 	    }
 	}
 
