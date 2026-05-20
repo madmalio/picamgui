@@ -23,7 +23,7 @@
   }
 
   .telemetry-label {
-    @apply text-[10px] uppercase tracking-wider text-zinc-500 font-bold;
+    @apply text-[10px] uppercase tracking-widest text-zinc-300 font-black drop-shadow-sm;
   }
 
   .telemetry-value {
